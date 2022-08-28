@@ -9,16 +9,38 @@ use popol;
 
 type Result<R, E> = std::result::Result<R, E>;
 
+fn parse_args() -> Result<(String, u16, u32), Box<dyn std::error::Error>> {
+	let mut args = std::env::args().skip(1);
+	let mysql_url = match args.next() {
+		Some(env) if env == "env" =>
+			match std::env::var("PROXYSQL_BINLOG_READER_MYSQL_URL") {
+				Err(_) => Err("missing environment variable PROXYSQL_BINLOG_READER_MYSQL_URL")?,
+				Ok(e) => e,
+			},
+		Some(url) => url,
+		None => Err("missing mandatory first parameter")?,
+	};
+	let listen_port = args.next().map(|s| s.parse()).unwrap_or(Ok(8888))?;
+	let server_id = args.next().map(|s| s.parse()).unwrap_or(Ok(100))?;
+
+	Ok((mysql_url, listen_port, server_id))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-	let mut args = std::env::args().skip(1);
-	let listen_port = args.next().map(|s| s.parse()).unwrap_or(Ok(8888))?;
-	let mysql_port = args.next().map(|s| s.parse()).unwrap_or(Ok(3306))?;
-	let server_id = args.next().map(|s| s.parse()).unwrap_or(Ok(100))?;
+	let (mysql_url, listen_port, server_id) = match parse_args() {
+		Err(e) => {
+			println!("Error parsing arguments: {}", e);
+			println!("\nSyntax: {} {{\"env\" | mysql connection url}} [port to listen on for proxysql connections] [our slave server_id]", std::env::args().next().unwrap());
+			println!("\texample mysql connection url: mysql://replication_user:replication_pw@localhost:3306/?prefer_socket=false");
+			return Ok(());
+		},
+		Ok(p) => p,
+	};
 
 	/// The identifier we'll use with `popol` to figure out the source of an event.
 	/// The `K` in `Sources<K>`.
-	#[derive(Eq, PartialEq, Clone)]
+	#[derive(Eq, PartialEq, Clone, Debug)]
 	enum Source {
 		/// An event from a connected peer.
 		Peer(SocketAddr),
@@ -31,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let (tx, rx) = sync_channel(4);
 	let waker = popol::Waker::new(&mut sources, Source::Waker)?;
 
-	std::thread::spawn(move || {
-		if let Err(e) = receive_binlog(waker, tx, mysql_port, server_id) {
+	let mysql_thread = std::thread::spawn(move || {
+		if let Err(e) = receive_binlog(waker, tx, &mysql_url, server_id) {
 			println!("error receiving binary log: {:?}", e);
 		}
 	});
@@ -62,7 +84,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	'a: loop {
 		// Wait for something to happen on our sources.
 		if let Some((until, _)) = delay_list.front() {
-			sources.wait_timeout(&mut events, until.duration_since(Instant::now()))?;
+			match sources.wait_timeout(&mut events, until.duration_since(Instant::now())) {
+				Ok(()) => {},
+				Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {},
+				Err(err) => Err(err)?,
+			};
 		} else {
 			sources.wait(&mut events)?;
 		}
@@ -75,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 
 		for (key, event) in events.iter() {
+			//println!("event: key {:?}, event {:?}", key, event);
 			match key {
 				Source::Listener => loop {
 					// Accept as many connections as we can.
@@ -90,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						popol::interest::READ
 					);
 					if let Some(last) = last_gtid.as_ref() {
-						conn.write(format!("ST={}_{}:{}-{}\n", last.domain, last.server, last.id, last.id).as_bytes())?;
+						conn.write(format!("ST={}:{}-{}\n", last.to_uuid(), last.id, last.id).as_bytes())?;
 					}
 					clients.push(conn);
 
@@ -102,8 +129,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 					sources.unregister(key);
 				}
 				Source::Waker => {
+					if let Err(_) = popol::Waker::reset(event.source) {
+						break 'a; // waker dropped - mysql thread finished
+					}
 					match rx.try_recv() {
 						Ok(gtid) => {
+							println!("got {:?}", gtid);
 							if server_id == 100 {
 								delay_list.push_back((Instant::now() + Duration::from_secs(30), gtid));
 							} else {
@@ -118,6 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 	}
 	
+	mysql_thread.join().unwrap();
+
 	Ok(())
 }
 
@@ -142,6 +175,13 @@ struct Gtid {
 	domain: u32,
 	server: u32,
 	id: u64,
+}
+
+impl Gtid {
+	fn to_uuid(&self) -> Uuid<'_> {
+		Uuid { gtid: self }
+	}
+
 }
 
 impl std::str::FromStr for Gtid {
@@ -169,11 +209,26 @@ impl Display for Gtid {
 	}
 }
 
-fn receive_binlog(waker: popol::Waker, tx: SyncSender<Gtid>, port: u16, server_id: u32) -> Result<(), Box<dyn std::error::Error>> {
-	let url = format!("mysql://replication_user:replication@localhost:{}/?prefer_socket=false", port);
-	let mut connection = Conn::new(&url[..])?;
+struct Uuid<'a> {
+	gtid: &'a Gtid,
+}
 
-	let mut gtid : Gtid = connection.query_first::<String, _>("select @@gtid_binlog_pos")?.unwrap().parse()?;
+impl<'a> Display for Uuid<'a> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+		write!(f, "{:0>8X}-0000-0000-0000-{:0>8X}", self.gtid.domain, self.gtid.server)
+	}
+}
+
+fn receive_binlog(waker: popol::Waker, tx: SyncSender<Gtid>, url: &str, server_id: u32) -> Result<(), Box<dyn std::error::Error>> {
+	let mut connection = Conn::new(url)?;
+
+	let mut gtid : Gtid = match connection.query_first::<String, _>("select @@gtid_binlog_pos")?.unwrap() {
+		gtid if gtid.len() == 0 => {
+			println!("WARNING: server reports empty gtid_binlog_pos - probably it hasn't replicated any transaction yet. Using gtid_slave_pos instead.");
+			connection.query_first::<String, _>("select @@gtid_slave_pos")?.unwrap()
+		},
+		gtid => gtid,
+	}.parse()?;
 	println!("starting from: {:?}", gtid);
 	//let uuid = 
 
