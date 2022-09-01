@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	listener.set_nonblocking(true)?;
 
 	let mut clients = Vec::with_capacity(4);
-	let mut last_gtid : Option<Gtid> = None;
+	let mut last_gtid = rx.recv()?; // await first gtid before accepting any connections
 
 	let mut delay_list = VecDeque::<(Instant, Gtid)>::new();
 
@@ -116,9 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						&conn,
 						popol::interest::READ
 					);
-					if let Some(last) = last_gtid.as_ref() {
-						conn.write(format!("ST={}:{}-{}\n", last.to_uuid(), last.id, last.id).as_bytes())?;
-					}
+					conn.write(format!("ST={}:{}-{}\n", last_gtid.to_uuid(), last_gtid.id, last_gtid.id).as_bytes())?;
 					clients.push(conn);
 
 					println!("got {} clients", clients.len());
@@ -154,18 +152,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	Ok(())
 }
 
-fn handle_gtid(gtid: Gtid, last_gtid: &mut Option<Gtid>, clients: &[TcpStream]) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_gtid(gtid: Gtid, last: &mut Gtid, clients: &[TcpStream]) -> Result<(), Box<dyn std::error::Error>> {
 	println!("got new id {}", gtid);
-	let msg = match last_gtid {
-		Some(last) if gtid.domain == last.domain && gtid.server == last.server =>
-			format!("I2={}\n", gtid.id),
-		_ =>
-			format!("I1={}_{}:{}\n", gtid.domain, gtid.server, gtid.id),
+	let msg = if gtid.domain == last.domain && gtid.server == last.server {
+		format!("I2={}\n", gtid.id)
+	} else {
+		format!("I1={}:{}\n", gtid.to_uuid(), gtid.id)
 	};
 	for mut client in clients.iter() {
 		client.write(msg.as_bytes())?;
 	}
-	*last_gtid = Some(gtid);
+	*last = gtid;
 
 	Ok(())
 }
