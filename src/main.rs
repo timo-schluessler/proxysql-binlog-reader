@@ -9,7 +9,7 @@ use popol;
 
 type Result<R, E> = std::result::Result<R, E>;
 
-fn parse_args() -> Result<(String, u16, u32), Box<dyn std::error::Error>> {
+fn parse_args() -> Result<(String, u16, u32, Duration), Box<dyn std::error::Error>> {
 	let mut args = std::env::args().skip(1);
 	let mysql_url = match args.next() {
 		Some(env) if env == "env" =>
@@ -22,16 +22,17 @@ fn parse_args() -> Result<(String, u16, u32), Box<dyn std::error::Error>> {
 	};
 	let listen_port = args.next().map(|s| s.parse()).unwrap_or(Ok(8888))?;
 	let server_id = args.next().map(|s| s.parse()).unwrap_or(Ok(100))?;
+	let simulated_delay = Duration::from_millis(args.next().map(|s| s.parse()).unwrap_or(Ok(0))?);
 
-	Ok((mysql_url, listen_port, server_id))
+	Ok((mysql_url, listen_port, server_id, simulated_delay))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-	let (mysql_url, listen_port, server_id) = match parse_args() {
+	let (mysql_url, listen_port, server_id, simulated_delay) = match parse_args() {
 		Err(e) => {
 			println!("Error parsing arguments: {}", e);
-			println!("\nSyntax: {} {{\"env\" | mysql connection url}} [port to listen on for proxysql connections] [our slave server_id]", std::env::args().next().unwrap());
+			println!("\nSyntax: {} {{\"env\" | mysql connection url}} [port to listen on for proxysql connections] [our slave server_id] [simulated delay in ms]", std::env::args().next().unwrap());
 			println!("\texample mysql connection url: mysql://replication_user:replication_pw@localhost:3306/?prefer_socket=false");
 			return Ok(());
 		},
@@ -132,11 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 					}
 					match rx.try_recv() {
 						Ok(gtid) => {
-							println!("got {:?}", gtid);
-							if server_id == 100 {
-								delay_list.push_back((Instant::now() + Duration::from_secs(30), gtid));
-							} else {
+							if simulated_delay.is_zero() {
 								handle_gtid(gtid, &mut last_gtid, &clients)?;
+							} else {
+								delay_list.push_back((Instant::now() + simulated_delay, gtid));
 							}
 						},
 						Err(TryRecvError::Empty) => (),
@@ -153,7 +153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn handle_gtid(gtid: Gtid, last: &mut Gtid, clients: &[TcpStream]) -> Result<(), Box<dyn std::error::Error>> {
-	println!("got new id {}", gtid);
 	let msg = if gtid.domain == last.domain && gtid.server == last.server {
 		format!("I2={}\n", gtid.id)
 	} else {
@@ -226,7 +225,7 @@ fn receive_binlog(waker: popol::Waker, tx: SyncSender<Gtid>, url: &str, server_i
 		},
 		gtid => gtid,
 	}.parse()?;
-	println!("starting from: {:?}", gtid);
+	println!("starting from: {}", gtid);
 	//let uuid = 
 
 	connection.query_drop("set @mariadb_slave_capability=4")?;
@@ -242,8 +241,7 @@ fn receive_binlog(waker: popol::Waker, tx: SyncSender<Gtid>, url: &str, server_i
 	while let Some(entry) = binlog.next() {
 		match entry {
 			Ok(entry) => {
-				// TODO detect repliation domain or server id change (uuid in mysql terms)
-				println!("type: {:?}, server: {}", entry.header().event_type(), entry.header().server_id());
+				//println!("type: {:?}, server: {}", entry.header().event_type(), entry.header().server_id());
 				if entry.header().event_type() == Err(mysql::binlog::UnknownEventType(0xa2)) {
 					gtid.id = u64::from_le_bytes(entry.data()[0..8].try_into().unwrap());
 					gtid.server = entry.header().server_id();
