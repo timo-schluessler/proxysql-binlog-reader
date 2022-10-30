@@ -78,8 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let mut delay_list = VecDeque::<(Instant, Gtid)>::new();
 
-	// bootstrap: ST= uuid:from-to,uuid:from-to
-	// update: I1= uuid:id
+	// bootstrap: ST= uuid:from-to,uuid:from-to (uuid including dashes)
+	// update: I1= uuid:id (uuid without dashes)
 	// update: I2= id
 
 	'a: loop {
@@ -156,7 +156,7 @@ fn handle_gtid(gtid: Gtid, last: &mut Gtid, clients: &[TcpStream]) -> Result<(),
 	let msg = if gtid.domain == last.domain && gtid.server == last.server {
 		format!("I2={}\n", gtid.id)
 	} else {
-		format!("I1={}:{}\n", gtid.to_uuid(), gtid.id)
+		format!("I1={}:{}\n", gtid.to_uuid_without_dashes(), gtid.id)
 	};
 	for mut client in clients.iter() {
 		client.write(msg.as_bytes())?;
@@ -176,6 +176,9 @@ struct Gtid {
 impl Gtid {
 	fn to_uuid(&self) -> Uuid<'_> {
 		Uuid { gtid: self }
+	}
+	fn to_uuid_without_dashes(&self) -> UuidWithoutDashes<'_> {
+		UuidWithoutDashes { gtid: self }
 	}
 
 }
@@ -212,6 +215,16 @@ struct Uuid<'a> {
 impl<'a> Display for Uuid<'a> {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
 		write!(f, "{:0>8X}-0000-0000-0000-{:0>8X}", self.gtid.domain, self.gtid.server)
+	}
+}
+
+struct UuidWithoutDashes<'a> {
+	gtid: &'a Gtid,
+}
+
+impl<'a> Display for UuidWithoutDashes<'a> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+		write!(f, "{:0>8X}000000000000{:0>8X}", self.gtid.domain, self.gtid.server)
 	}
 }
 
