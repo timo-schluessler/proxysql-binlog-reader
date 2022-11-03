@@ -214,7 +214,7 @@ struct Uuid<'a> {
 
 impl<'a> Display for Uuid<'a> {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-		write!(f, "{:0>8X}-0000-0000-0000-{:0>8X}", self.gtid.domain, self.gtid.server)
+		write!(f, "{:0>8X}-0000-0000-0000-{:0>12X}", self.gtid.domain, self.gtid.server)
 	}
 }
 
@@ -224,7 +224,7 @@ struct UuidWithoutDashes<'a> {
 
 impl<'a> Display for UuidWithoutDashes<'a> {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-		write!(f, "{:0>8X}000000000000{:0>8X}", self.gtid.domain, self.gtid.server)
+		write!(f, "{:0>8X}000000000000{:0>12X}", self.gtid.domain, self.gtid.server)
 	}
 }
 
