@@ -11,3 +11,6 @@ mysql = { version = "*", default-features = false, features = [ ] }
 flate2 = { version = "*", default-features = false, features = ["zlib"] }
 mysql_common = { version = "*", default-features = false, features = []} #"bigdecimal03", "time03", "uuid"]}
 popol = "*"
+
+[profile.release]
+lto = true

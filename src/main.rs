@@ -134,17 +134,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 					if popol::Waker::reset(event.source).is_err() {
 						break 'a; // waker dropped - mysql thread finished
 					}
-					match rx.try_recv() {
-						Ok(gtid) => {
-							if simulated_delay.is_zero() {
-								handle_gtid(gtid, &mut last_gtid, &clients)?;
-							} else {
-								delay_list.push_back((Instant::now() + simulated_delay, gtid));
+					loop { // waker may join multiple calls into one wakeup - loop to read them all
+						match rx.try_recv() {
+							Ok(gtid) => {
+								if simulated_delay.is_zero() {
+									handle_gtid(gtid, &mut last_gtid, &clients)?;
+								} else {
+									delay_list.push_back((Instant::now() + simulated_delay, gtid));
+								}
 							}
-						}
-						Err(TryRecvError::Empty) => (),
-						Err(TryRecvError::Disconnected) => break 'a,
-					};
+							Err(TryRecvError::Empty) => break,
+							Err(TryRecvError::Disconnected) => break 'a,
+						};
+					}
 				}
 			}
 		}
@@ -257,7 +259,7 @@ fn receive_binlog(
 		},
 		gtid => gtid,
 	}.parse()?;
-	println!("starting from: {}", gtid);
+	println!("starting from: {}", gtid); // TODO gather some gtid's from the past - otherwise proxysql may wait indefinitely for some past gtid
 	//let uuid =
 
 	connection.query_drop("set @mariadb_slave_capability=4")?;
@@ -277,7 +279,7 @@ fn receive_binlog(
 				if entry.header().event_type() == Err(mysql::binlog::UnknownEventType(0xa2)) {
 					gtid.id = u64::from_le_bytes(entry.data()[0..8].try_into().unwrap());
 					gtid.server = entry.header().server_id();
-					println!("gtid is: {}", gtid);
+					//println!("gtid is: {}", gtid);
 					tx.send(gtid.clone())?;
 					waker.wake().unwrap();
 				}
