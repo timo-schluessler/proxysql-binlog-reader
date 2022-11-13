@@ -70,9 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	listener.set_nonblocking(true)?;
 
 	let mut clients = Vec::with_capacity(4);
-	let mut last_gtid = rx.recv()?; // await first gtid before accepting any connections
 
 	let mut delay_list = VecDeque::<(Instant, Gtid)>::new();
+	let mut known_gtids = Gtids::new(rx.recv()?); // await first gtid before accepting any connections
 
 	// bootstrap: ST= uuid:from-to,uuid:from-to (uuid including dashes)
 	// update: I1= uuid:id (uuid without dashes)
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			if until > &Instant::now() {
 				break;
 			}
-			handle_gtid(delay_list.pop_front().unwrap().1, &mut last_gtid, &clients)?;
+			handle_gtid(delay_list.pop_front().unwrap().1, &mut known_gtids, &clients)?;
 		}
 
 		for (key, event) in events.iter() {
@@ -109,15 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 					};
 					// Register the new peer using the `Peer` variant of `Source`.
 					sources.register(Source::Peer(addr), &conn, popol::interest::READ);
-					conn.write_all(
-						format!(
-							"ST={}:{}-{}\n",
-							last_gtid.to_uuid(),
-							last_gtid.id,
-							last_gtid.id
-						)
-						.as_bytes(),
-					)?;
+					conn.write_all(format!("ST={}\n", known_gtids).as_bytes())?;
 					clients.push(conn);
 
 					println!("got {} clients", clients.len());
@@ -138,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 						match rx.try_recv() {
 							Ok(gtid) => {
 								if simulated_delay.is_zero() {
-									handle_gtid(gtid, &mut last_gtid, &clients)?;
+									handle_gtid(gtid, &mut known_gtids, &clients)?;
 								} else {
 									delay_list.push_back((Instant::now() + simulated_delay, gtid));
 								}
@@ -159,10 +151,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_gtid(
 	gtid: Gtid,
-	last: &mut Gtid,
+	gtids: &mut Gtids,
 	clients: &[TcpStream],
 ) -> Result<(), Box<dyn std::error::Error>> {
-	let msg = if gtid.domain == last.domain && gtid.server == last.server {
+	assert_eq!(gtid.domain, gtids.domain);
+	let msg = if gtids.add(&gtid) {
 		format!("I2={}\n", gtid.id)
 	} else {
 		format!("I1={}:{}\n", gtid.to_uuid_without_dashes(), gtid.id)
@@ -170,7 +163,6 @@ fn handle_gtid(
 	for mut client in clients.iter() {
 		client.write_all(msg.as_bytes())?;
 	}
-	*last = gtid;
 
 	Ok(())
 }
@@ -213,6 +205,117 @@ use std::fmt::{Display, Formatter};
 impl Display for Gtid {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
 		write!(f, "{}-{}-{}", self.domain, self.server, self.id)
+	}
+}
+
+struct Gtids {
+	domain: u32,
+	servers: Vec<GtidsPerServer>,
+}
+
+impl Gtids {
+	fn new(gtid: Gtid) -> Gtids {
+		Gtids {
+			domain: gtid.domain,
+			servers: vec![GtidsPerServer::new(gtid.server, gtid.id)],
+		}
+	}
+
+	fn add(&mut self, gtid: &Gtid) -> bool {
+		assert_eq!(self.domain, gtid.domain); // domain should never change
+		if let Some((i, server)) = self.servers.iter_mut().enumerate().find(|(_, s)| s.server == gtid.server) {
+			server.add(gtid.id);
+			if i == 0 {
+				return true;
+			}
+			self.servers[0..=i].rotate_right(1); // keep latest server at the beginning
+			//self.servers.swap(i, self.servers.len() - 1); // keep latest server at the end
+			return false;
+		} else {
+			self.servers.insert(0, GtidsPerServer::new(gtid.server, gtid.id));
+			if self.servers.len() > 10 {
+				self.servers.remove(self.servers.len() - 1);
+			}
+			return false;
+		}
+	}
+}
+
+impl Display for Gtids {
+	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+		for server in self.servers.iter() {
+			let gtid = Gtid {
+				domain: self.domain,
+				server: server.server,
+				id: 0,
+			};
+			for ids in server.id_ranges.iter() {
+				write!(f, "{}:{}-{},", gtid.to_uuid(), ids.first, ids.last)?;
+			}
+		}
+		Ok(())
+	}
+}
+
+struct GtidsPerServer {
+	server: u32,
+	id_ranges: Vec<IdRange>,
+}
+
+impl GtidsPerServer {
+	fn new(server: u32, id: u64) -> GtidsPerServer {
+		GtidsPerServer {
+			server,
+			id_ranges: vec![IdRange::new(id)],
+		}
+	}
+
+	fn add(&mut self, id: u64) {
+		assert!(!self.id_ranges.is_empty());
+		let next = match self.id_ranges.iter().rposition(|range| range.last < id) {
+			None => {
+				0
+			},
+			Some(i) => {
+				if self.id_ranges[i].last + 1 == id { // new id is one after existing range
+					if i + 1 != self.id_ranges.len() && id + 1 == self.id_ranges[i + 1].first { // new id fills gap between two existing ranges
+						self.id_ranges[i].last = self.id_ranges[i + 1].last;
+						self.id_ranges.remove(i + 1);
+					} else {
+						self.id_ranges[i].last = id;
+					}
+					return;
+				}
+				i + 1
+			}
+		};
+
+		if next != self.id_ranges.len() && id + 1 == self.id_ranges[next].first { // new id is one before existing range
+			self.id_ranges[next].first = id;
+		} else if next != self.id_ranges.len() && id >= self.id_ranges[next].first { // id is contained in existing range
+			// no action required
+			// the rposition condition above said (id_ranges[next].last < id) == false 
+			// => id_ranges[next].last >= id
+		} else { // insert new range
+			self.id_ranges.insert(next, IdRange::new(id));
+			if self.id_ranges.len() > 10 {
+				self.id_ranges.remove(0);
+			}
+		}
+	}
+}
+
+struct IdRange {
+	first: u64,
+	last: u64,
+}
+
+impl IdRange {
+	fn new(id: u64) -> IdRange {
+		IdRange {
+			first: id,
+			last: id,
+		}
 	}
 }
 
@@ -260,13 +363,23 @@ fn receive_binlog(
 		gtid => gtid,
 	}.parse()?;
 	println!("starting from: {}", gtid); // TODO gather some gtid's from the past - otherwise proxysql may wait indefinitely for some past gtid
-	//let uuid =
 
+	struct BinaryLog {
+		name: String,
+		size: u64,
+	}
+	let logs = connection.query_map("show binary logs", |(name, size)| BinaryLog { name, size })?;
+
+	let mut request = BinlogRequest::new(server_id);
 	connection.query_drop("set @mariadb_slave_capability=4")?;
-	connection.query_drop(format!("set @slave_connect_state='{}'", gtid))?;
+	if let Some(log) = logs.first() {
+		request = request.with_filename(log.name.as_bytes()).with_pos(4u64);
+	} else {
+		connection.query_drop(format!("set @slave_connect_state='{}'", gtid))?;
+	}
 	connection.query_drop("set @slave_gtid_strict_mode=1")?;
 
-	let binlog = connection.get_binlog_stream(BinlogRequest::new(server_id))?;
+	let binlog = connection.get_binlog_stream(request)?;
 	// .with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK))?; <- this closes the connection if it would block :(
 
 	tx.send(gtid.clone())?;
