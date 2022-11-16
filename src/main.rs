@@ -223,7 +223,12 @@ impl Gtids {
 
 	fn add(&mut self, gtid: &Gtid) -> bool {
 		assert_eq!(self.domain, gtid.domain); // domain should never change
-		if let Some((i, server)) = self.servers.iter_mut().enumerate().find(|(_, s)| s.server == gtid.server) {
+		if let Some((i, server)) = self
+			.servers
+			.iter_mut()
+			.enumerate()
+			.find(|(_, s)| s.server == gtid.server)
+		{
 			server.add(gtid.id);
 			if i == 0 {
 				return true;
@@ -232,7 +237,8 @@ impl Gtids {
 			//self.servers.swap(i, self.servers.len() - 1); // keep latest server at the end
 			return false;
 		} else {
-			self.servers.insert(0, GtidsPerServer::new(gtid.server, gtid.id));
+			self.servers
+				.insert(0, GtidsPerServer::new(gtid.server, gtid.id));
 			if self.servers.len() > 10 {
 				self.servers.remove(self.servers.len() - 1);
 			}
@@ -273,9 +279,7 @@ impl GtidsPerServer {
 	fn add(&mut self, id: u64) {
 		assert!(!self.id_ranges.is_empty());
 		let next = match self.id_ranges.iter().rposition(|range| range.last < id) {
-			None => {
-				0
-			},
+			None => 0,
 			Some(i) => {
 				if self.id_ranges[i].last + 1 == id { // new id is one after existing range
 					if i + 1 != self.id_ranges.len() && id + 1 == self.id_ranges[i + 1].first { // new id fills gap between two existing ranges
@@ -362,28 +366,24 @@ fn receive_binlog(
 		},
 		gtid => gtid,
 	}.parse()?;
-	println!("starting from: {}", gtid); // TODO gather some gtid's from the past - otherwise proxysql may wait indefinitely for some past gtid
-
-	struct BinaryLog {
-		name: String,
-		size: u64,
-	}
-	let logs = connection.query_map("show binary logs", |(name, size)| BinaryLog { name, size })?;
+	let start_with_logfile = find_binlog_filename(&mut connection, 1024 * 1024 * 10);
 
 	let mut request = BinlogRequest::new(server_id);
 	connection.query_drop("set @mariadb_slave_capability=4")?;
-	if let Some(log) = logs.first() {
-		request = request.with_filename(log.name.as_bytes()).with_pos(4u64);
-	} else {
+	if let Some(name) = start_with_logfile.as_ref() {
+		println!("starting with logfile {}", name);
+		request = request.with_filename(name.as_bytes()).with_pos(4u64); // logs star at position 4 (after magic bytes)
+	} else {	
+		println!("starting from gtid {}", gtid);
 		connection.query_drop(format!("set @slave_connect_state='{}'", gtid))?;
+
+		tx.send(gtid.clone())?;
+		waker.wake().unwrap();
 	}
 	connection.query_drop("set @slave_gtid_strict_mode=1")?;
 
 	let binlog = connection.get_binlog_stream(request)?;
 	// .with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK))?; <- this closes the connection if it would block :(
-
-	tx.send(gtid.clone())?;
-	waker.wake().unwrap();
 
 	for entry in binlog {
 		match entry {
@@ -402,3 +402,27 @@ fn receive_binlog(
 	}
 	Ok(())
 }
+
+fn find_binlog_filename(connection: &mut Conn, approx_byte_distance: u64) -> Option<String> {
+	#[derive(Debug)]
+	struct BinaryLog {
+		name: String,
+		size: u64,
+	}
+
+	let mut logs = connection
+		.query_map("show binary logs", |(name, size)| BinaryLog { name, size })
+		.ok()?
+		.into_iter();
+	let mut size = 0;
+	let first = logs.next();
+	for log in logs.rev() {
+		size += log.size;
+		if size > approx_byte_distance {
+			return Some(log.name);
+		}
+	}
+
+	first.map(|l| l.name)
+}
+
