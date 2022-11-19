@@ -249,7 +249,7 @@ impl Gtids {
 
 impl Display for Gtids {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-		for server in self.servers.iter() {
+		for server in self.servers.iter().rev() { // .rev() because latest server is at beginning and we want to send the latest last to proxysql
 			let gtid = Gtid {
 				domain: self.domain,
 				server: server.server,
