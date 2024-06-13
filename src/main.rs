@@ -193,6 +193,8 @@ impl Gtid {
 
 	fn set_server(&mut self, server_id: u32) {
 		use uuid::Bytes;
+		#[allow(unknown_lints)]
+		#[allow(invalid_reference_casting)]
 		let bytes =
 			unsafe { &mut *(self.uuid.as_bytes() as *const Bytes as *mut Bytes) }; // safe because uuid is &mut - unfortunately uuid has no update or as_bytes_mut() fn's
 		BigEndian::write_u32(&mut bytes[12..16], server_id);
